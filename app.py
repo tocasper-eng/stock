@@ -1,116 +1,104 @@
-from flask import Flask, render_template_string, request, send_file
+import os
+from flask import Flask, render_template_string, request
 import yfinance as yf
 import matplotlib.pyplot as plt
 import io
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# 解決 Matplotlib 在伺服器環境無顯示器的問題
+import matplotlib
+matplotlib.use('Agg')
 
 app = Flask(__name__)
 
-# HTML 模板，用於接收日期輸入和顯示圖表
+# 使用簡單的字典做記憶體緩存，避免重複請求觸發 Rate Limit
+data_cache = {}
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>台積電股價圖表</title>
+    <title>台積電股價分析</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; }
-        .container { background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); max-width: 800px; margin: auto; }
-        h1 { color: #333; text-align: center; margin-bottom: 30px; }
-        form { display: flex; flex-direction: column; gap: 15px; margin-bottom: 30px; }
-        label { font-weight: bold; color: #555; }
-        input[type="date"] { padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 16px; }
-        button { background-color: #007bff; color: white; padding: 12px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; transition: background-color 0.3s ease; }
-        button:hover { background-color: #0056b3; }
-        .error { color: red; text-align: center; margin-top: 20px; }
-        .chart-container { text-align: center; margin-top: 30px; }
-        .chart-container img { max-width: 100%; height: auto; border: 1px solid #eee; border-radius: 4px; }
-        .footer { text-align: center; margin-top: 40px; color: #777; font-size: 0.9em; }
+        body { font-family: "Microsoft JhengHei", sans-serif; background: #f0f2f5; padding: 40px; }
+        .card { background: white; max-width: 900px; margin: auto; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .input-group { margin-bottom: 20px; display: flex; gap: 10px; align-items: center; justify-content: center; }
+        input { padding: 8px; border-radius: 4px; border: 1px solid #ddd; }
+        button { padding: 8px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .msg { text-align: center; color: #666; }
+        .error { color: #d9534f; background: #f9d6d5; padding: 10px; border-radius: 4px; text-align: center; }
+        img { width: 100%; height: auto; margin-top: 20px; border-radius: 8px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>台積電 (2330.TW) 股價查詢</h1>
-
-        <form method="POST">
-            <label for="start_date">開始日期:</label>
-            <input type="date" id="start_date" name="start_date" value="{{ start_date | default(today) }}" required>
-
-            <label for="end_date">結束日期:</label>
-            <input type="date" id="end_date" name="end_date" value="{{ end_date | default(today) }}" required>
-
-            <button type="submit">查詢並繪製圖表</button>
+    <div class="card">
+        <h2 style="text-align:center;">台積電 (2330.TW) 歷史股價查詢</h2>
+        <form method="POST" class="input-group">
+            <input type="date" name="start" value="{{ start }}" required>
+            <span>至</span>
+            <input type="date" name="end" value="{{ end }}" required>
+            <button type="submit">開始繪製</button>
         </form>
 
-        {% if error %}
-            <p class="error">{{ error }}</p>
-        {% endif %}
-
-        {% if chart_img %}
-            <h2>股價走勢圖</h2>
-            <div class="chart-container">
-                <img src="data:image/png;base64,{{ chart_img }}" alt="台積電股價圖表">
-            </div>
-        {% endif %}
-    </div>
-    <div class="footer">
-        <p>資料來源: Yahoo Finance</p>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        {% if chart %}<img src="data:image/png;base64,{{ chart }}">{% endif %}
+        <p class="msg">提示：若遇到頻率限制，請稍候 5 分鐘再試。</p>
     </div>
 </body>
 </html>
 """
 
+def get_stock_data(symbol, start, end):
+    cache_key = f"{symbol}_{start}_{end}"
+    if cache_key in data_cache:
+        return data_cache[cache_key]
+    
+    # 使用 Ticker 物件下載，穩定性較高
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(start=start, end=end)
+    
+    if not df.empty:
+        data_cache[cache_key] = df
+    return df
+
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    chart_img = None
+    chart = None
     error = None
-    today = datetime.now().strftime('%Y-%m-%d')
-    start_date_str = request.form.get('start_date')
-    end_date_str = request.form.get('end_date')
+    # 預設顯示過去一個月的資料
+    default_start = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    default_end = datetime.now().strftime('%Y-%m-%d')
+    
+    start_date = request.form.get('start', default_start)
+    end_date = request.form.get('end', default_end)
 
-    if request.method == 'POST' and start_date_str and end_date_str:
+    if request.method == 'POST':
         try:
-            start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
-            end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
-
-            if start_date > end_date:
-                error = "開始日期不能晚於結束日期。"
+            df = get_stock_data("2330.TW", start_date, end_date)
+            
+            if df.empty:
+                error = "查無資料或觸發 API 限制。請確認日期區間（週末休市）或稍後再試。"
             else:
-                # 爬取台積電股價 (2330.TW)
-                df = yf.download("2330.TW", start=start_date_str, end=end_date_str)
-
-                if df.empty:
-                    error = "在指定日期區間內沒有找到台積電的股價資料。"
-                else:
-                    # 繪製圖表
-                    plt.figure(figsize=(12, 6))
-                    plt.plot(df.index, df['Adj Close'], label='調整後收盤價', color='blue')
-                    plt.title(f'台積電 (2330.TW) 股價走勢圖 ({start_date_str} to {end_date_str})')
-                    plt.xlabel('日期')
-                    plt.ylabel('股價 (TWD)')
-                    plt.grid(True)
-                    plt.legend()
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-
-                    # 將圖表保存到記憶體並轉為 base64 編碼
-                    img_buffer = io.BytesIO()
-                    plt.savefig(img_buffer, format='png')
-                    img_buffer.seek(0)
-                    chart_img = base64.b64encode(img_buffer.read()).decode('utf-8')
-                    plt.close() # 關閉圖表以釋放記憶體
-
+                plt.figure(figsize=(12, 6))
+                plt.plot(df.index, df['Close'], marker='o', linestyle='-', color='#007bff', label='收盤價')
+                plt.title(f'TSMC (2330.TW) Price Trend', fontsize=16)
+                plt.xlabel('Date')
+                plt.ylabel('Price (TWD)')
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png', bbox_inches='tight')
+                chart = base64.b64encode(buf.getvalue()).decode('utf-8')
+                plt.close()
         except Exception as e:
-            error = f"處理請求時發生錯誤: {e}"
+            error = f"發生錯誤: {str(e)}"
 
-    return render_template_string(HTML_TEMPLATE, 
-                                  chart_img=chart_img, 
-                                  error=error,
-                                  today=today,
-                                  start_date=start_date_str,
-                                  end_date=end_date_str)
+    return render_template_string(HTML_TEMPLATE, chart=chart, error=error, start=start_date, end=end_date)
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    # Zeabur 會自動分配 PORT，我們讀取環境變數
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
